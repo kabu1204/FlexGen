@@ -53,6 +53,7 @@ class TorchCompressedDevice:
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        # (seq_len, b * n_head, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16,
@@ -199,6 +200,9 @@ class TorchCompressedDevice:
             data = data.view(flatten_shape)[indices].contiguous()
 
         return data.view(tensor.shape)
+    
+    def __str__(self) -> str:
+        return f"TorchCompressedDevice(base={self.base_device})"
 
 
 def general_copy_compressed(dst, dst_indices, src, src_indices):

@@ -259,6 +259,21 @@ def project_decode_latency(costs, prompt_len, gen_len):
 
     return decode_latency
 
+def write_torchprof_result(prof: torch.profiler.profile, dir: str, prefix: str):
+    subdir = os.path.join(dir, prefix)
+    if not os.path.exists(dir):
+        os.mkdir(dir)
+    if not os.path.exists(subdir):
+        os.mkdir(subdir)
+    
+    tablename = os.path.join(subdir, prefix + "_table.txt")
+    tracename = os.path.join(subdir, prefix + "_trace.json")
+    mem_timeline = os.path.join(subdir, prefix + "_memory-timeline.html")
+
+    with open(tablename, "w+") as f:
+        f.write(prof.key_averages(group_by_stack_n = 3).table(sort_by="cuda_time_total", row_limit=10))
+    prof.export_chrome_trace(tracename)
+    # prof.export_memory_timeline(mem_timeline)
 
 def write_benchmark_log(filename, model_size, cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
@@ -275,8 +290,8 @@ def write_benchmark_log(filename, model_size, cache_size, hidden_size,
                f"decode throughput: {decode_throughput:.3f} token/s\n"
                f"total latency: {total_latency:.3f} s\t"
                f"total throughput: {total_throughput:.3f} token/s")
-    with open(filename, "a") as fout:
-        fout.write(log_str + "\n")
+    # with open(filename, "a") as fout:
+    #     fout.write(log_str + "\n")
 
     return log_str
 

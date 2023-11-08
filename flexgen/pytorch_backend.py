@@ -21,6 +21,14 @@ general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
 
+# torch.ops.load_library("/home/ycy/repo/torch-gds/build/torch_ext/libmycopy.so")
+# to_dha = torch.ops.dha.to_dha
+# add_dha = torch.ops.dha.add_dha
+# is_dha_tensor = torch.ops.dha.is_dha_tensor
+
+to_dha = None
+add_dha = None
+is_dha_tensor = None
 
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
@@ -75,8 +83,8 @@ class TorchTensor:
     name_count = count()
 
     def __init__(self, shape, dtype, data, device, name=None):
-        if isinstance(data, torch.Tensor):
-            assert data.device == device.dev
+        # if isinstance(data, torch.Tensor):
+            # assert is_dha_tensor(data) or data.device == device.dev
 
         self.shape = shape
         self.dtype = dtype
@@ -130,6 +138,7 @@ class TorchTensor:
             shape = tuple(x.stop - x.start for x in src_indices
                 ) + self.shape[len(src_indices):]
         else:
+            # default branch
             shape = self.shape
 
         if dst.device_type == DeviceType.COMPRESSED:
@@ -181,13 +190,15 @@ class TorchDevice:
         dst = link.b if link.a == self else link.a
         self.links[dst] = link
 
-    def allocate(self, shape, dtype, pin_memory=None, name=None):
+    def allocate(self, shape, dtype, pin_memory=None, name=None, pin_dha=False):
         if self.device_type == DeviceType.CPU:
             pin_memory = True if pin_memory is None else pin_memory
         else:
             pin_memory = False
         dtype = np_dtype_to_torch_dtype[dtype]
         data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
+        if pin_dha:
+            data = to_dha(data)
         return TorchTensor.create_from_torch(data, self, name=name)
 
     def delete(self, tensor):
@@ -375,7 +386,7 @@ class TorchDevice:
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
 
-        b, tgt_s, h = inputs.shape
+        b, tgt_s, h = inputs.shape  # (b, 1, 7168)
         src_s = attention_mask.shape[1]
         head_dim = h // n_head
         scaling = head_dim ** -0.5
@@ -386,7 +397,7 @@ class TorchDevice:
         q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
         k = F.linear(hidden, w_k.data, bias=b_k.data)
         v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, 1, n_head, head_dim)
+        # shape: (b, 1, n_head, head_dim) ~ (b*14)KB
         q = q.view(b, tgt_s, n_head, head_dim)
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
@@ -408,6 +419,7 @@ class TorchDevice:
                     # shape: (s, b * n_head, head_dim)
                     k = k_cache.data[:src_s]
                     v = v_cache.data[:src_s]
+                # copy to the end
                 k[src_s - 1:src_s] = k_new
                 v[src_s - 1:src_s] = v_new
 
@@ -843,6 +855,7 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     elif (src.device.device_type == DeviceType.CPU and
           dst.device.device_type == DeviceType.CUDA and
           not src.data.is_pinned()):
+        # print("copy non-pinned cpu tensor to cuda")
         # The cpu tensor is not pinned, use pin_memory as a relay
         src = src.data[src_indices] if src_indices else src.data
         dst = dst.data[dst_indices] if dst_indices else dst.data

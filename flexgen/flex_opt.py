@@ -23,7 +23,9 @@ from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log)
+    read_benchmark_log, write_torchprof_result)
+
+from torch.profiler import profile, record_function, ProfilerActivity
 
 fix_recursive_import()
 
@@ -89,7 +91,7 @@ def get_choice(cur_percent, percents, choices):
     return choices[-1]
 
 
-def init_weight_list(weight_specs, policy, env):
+def init_weight_list(weight_specs, policy, env, pin_dha=False):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
 
@@ -109,8 +111,7 @@ def init_weight_list(weight_specs, policy, env):
             compress = policy.compress_weight
 
         if not compress:
-            weight = home.allocate(shape, dtype, pin_memory=pin_memory)
-
+            weight = home.allocate(shape, dtype, pin_memory=pin_memory, pin_dha=pin_dha)
             if DUMMY_WEIGHT not in filename:
                 weight.load_from_np_file(weight_specs[i][2])
             else:
@@ -128,15 +129,17 @@ def init_weight_list(weight_specs, policy, env):
                     x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
 
         ret.append(weight)
+        # weight: class pytorch_backend.TorchTensor
     return ret
 
 
 class InputEmbed:
-    def __init__(self, config, env, policy):
+    def __init__(self, config, env, policy, pin_dha=False):
         self.config = config
         self.env = env
         self.policy = policy
         self.compute = self.env.gpu
+        self.pin_dha = pin_dha
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
 
@@ -155,15 +158,18 @@ class InputEmbed:
             # w_pos
             ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-
+        weights = init_weight_list(weight_specs, self.policy, self.env, pin_dha=self.pin_dha)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_token, w_pos = weight_home.val
         if k == 0:
-            dst = self.weight_load_dst
-            weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
+            with record_function("<+>InputEmbed:load_weight"):
+                dst = self.weight_load_dst
+                if self.pin_dha:
+                    weight_read_buf.store(((w_token, True), (w_pos, True)))
+                else:
+                    weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -186,20 +192,23 @@ class InputEmbed:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
+            with record_function("<+>InputEmbed:clear_weight_from_gpu"):
+                (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
         else:
             (w_token, _), (w_pos, _) = weight_read_buf.val
 
-        h = self.compute.opt_input_embed(h, mask,
-            w_token, w_pos, self.config.pad_token_id, donate)
+        with record_function("<+>InputEmbed:compute"):
+            h = self.compute.opt_input_embed(h, mask,
+                w_token, w_pos, self.config.pad_token_id, donate)
         hidden.val = h
 
 
 class OutputEmbed:
-    def __init__(self, config, env, policy):
+    def __init__(self, config, env, policy, pin_dha=False):
         self.config = config
         self.env = env
         self.policy = policy
+        self.pin_dha = pin_dha
         self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
@@ -221,17 +230,21 @@ class OutputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
+        weights = init_weight_list(weight_specs, self.policy, self.env, pin_dha=self.pin_dha)
 
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_ln, b_ln, w_token = weight_home.val
         if k == 0:
-            dst1 = self.weight_load_dst
-            dst2 = self.compute
-            weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
-                w_token.smart_copy(dst1)))
+            with record_function("<+>OutputEmbed:load_weight"):
+                dst1 = self.weight_load_dst
+                dst2 = self.compute
+                if self.pin_dha:
+                    weight_read_buf.store(((w_ln, True), (b_ln, True), (w_token, True)))
+                else:
+                    weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
+                        w_token.smart_copy(dst1)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -252,12 +265,14 @@ class OutputEmbed:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
+            with record_function("<+>OutputEmbed:clear_weight_of_gpu"):
+                (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
         else:
             (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
-        h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
-            self.task.do_sample, self.task.temperature)
+        with record_function("<+>OutputEmbed:compute"):
+            h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
+                self.task.do_sample, self.task.temperature)
         hidden.val = h
 
 
@@ -307,6 +322,7 @@ class SelfAttention:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
+        # with record_function("<+>SelfAttention:load_weight"):
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
@@ -336,6 +352,7 @@ class SelfAttention:
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):
+        # with record_function("<+>SelfAttention:load_cache"):
         if i == 0:  # prefill, no cache
             return
 
@@ -359,9 +376,11 @@ class SelfAttention:
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
             indices = (slice(0, self.task.prompt_len + i),
-                       slice(0, k_home.shape[1]))
+                    slice(0, k_home.shape[1]))
+            # print(indices)
 
             if self.policy.attn_sparsity >= 1.0:
+                # default branch
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
@@ -375,7 +394,7 @@ class SelfAttention:
             # shape: (s, b * n_head, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
-                       slice(0, k_home.shape[1]))
+                    slice(0, k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
 
             if self.policy.attn_sparsity >= 1.0:
@@ -393,17 +412,18 @@ class SelfAttention:
             # shape: (s, b * n_head, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
-                       slice(gpu_k_buf.shape[1], k_home.shape[1]))
+                    slice(gpu_k_buf.shape[1], k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
             general_copy(v_buf, indices, v_home, indices)
             cache_read_buf.store((((gpu_k_buf, k_buf,), False),
-                                  ((gpu_v_buf, v_buf,), False)))
+                                ((gpu_v_buf, v_buf,), False)))
             assert self.policy.attn_sparsity >= 1.0
         else:
             raise ValueError(f"Invalid path: {path}")
 
     def store_cache(self, cache_home, cache_write_buf, i):
         # shape: (s, b * n_head, head_dim)
+        # with record_function("<+>SelfAttention:store_cache"):
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
 
@@ -412,11 +432,11 @@ class SelfAttention:
 
         if i == 0:  # prefill
             indices = (slice(0, k_new.shape[0]),
-                       slice(0, k_new.shape[1]))
+                    slice(0, k_new.shape[1]))
         else:  # decoding
             pos = self.task.prompt_len + i
             indices = (slice(pos - k_new.shape[0], pos),
-                       slice(0, k_new.shape[1]))
+                    slice(0, k_new.shape[1]))
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
@@ -433,9 +453,10 @@ class SelfAttention:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
+            # with record_function("<+>SelfAttention:clear_weight_of_gpu"):
             ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
-             (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
-             (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
+            (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
+            (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
         else:
             ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
              (w_v, _), (b_v, _), (w_out, _), (b_out, _),
@@ -495,6 +516,7 @@ class MLP:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
+        # with record_function("<+>MLP:load_weight"):
         wi, bi, wo, bo, w_ln, b_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
@@ -523,12 +545,14 @@ class MLP:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
+            # with record_function("<+>MLP:clear_weight_of_gpu"):
             ((wi, donate[1]), (bi, donate[2]), (wo, donate[3]), (bo, donate[4]),
-             (w_ln, donate[5]), (b_ln, donate[6])) = weight_read_buf.pop()
+            (w_ln, donate[5]), (b_ln, donate[6])) = weight_read_buf.pop()
         else:
             ((wi, _), (bi, _), (wo, _), (bo, _),
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
+        # with record_function("<+>MLP:compute"):
         h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
         hidden.val = h
 
@@ -556,27 +580,33 @@ class TransformerLayer:
         self.attention.load_weight(home1, read_buf1, k)
         self.mlp.load_weight(home2, read_buf2, k)
         if k == 0:
-            weight_read_buf.store((read_buf1, read_buf2))
+            with record_function("<+>Attention:load_weight"):
+                weight_read_buf.store((read_buf1, read_buf2))
 
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
 
     def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
+        with record_function("<+>Attention:load_cache"):
+            self.attention.load_cache(cache_home, cache_read_buf, i)
 
     def store_cache(self, cache_home, cache_write_buf, i):
-        self.attention.store_cache(cache_home, cache_write_buf, i)
+        with record_function("<+>Attention:store_weight"):
+            self.attention.store_cache(cache_home, cache_write_buf, i)
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         if k == self.policy.num_gpu_batches - 1:
-            read_buf1, read_buf2 = weight_read_buf.pop()
+            with record_function("<+>Attention:clear_weight"):
+                read_buf1, read_buf2 = weight_read_buf.pop()
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
-        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
-                               cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
+        with record_function("<+>Attention:compute"):
+            print("compute")
+            self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
+                                cache_write_buf, i, k)
+            self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
 
 
 class OptLM:
@@ -592,16 +622,17 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
+        self.pin_dha = False
 
         layers = []
-        layers.append(InputEmbed(self.config, self.env, self.policy))
+        layers.append(InputEmbed(self.config, self.env, self.policy, pin_dha=self.pin_dha))
         for i in range(self.config.num_hidden_layers):
             if policy.sep_layer:
                 layers.append(SelfAttention(self.config, self.env, self.policy, i))
                 layers.append(MLP(self.config, self.env, self.policy, i))
             else:
                 layers.append(TransformerLayer(self.config, self.env, self.policy, i))
-        layers.append(OutputEmbed(self.config, self.env, self.policy))
+        layers.append(OutputEmbed(self.config, self.env, self.policy, pin_dha=self.pin_dha))
         self.layers = layers
         self.num_layers = len(layers)
 
@@ -647,7 +678,6 @@ class OptLM:
         check_path = os.path.join(expanded_path, "decoder.embed_positions.weight")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             download_opt_weights(self.config.name, self.path)
-
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
     def load_weight(self, i, j, k, overlap=True):
@@ -830,7 +860,8 @@ class OptLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0):
+                 verbose: int = 0,
+                 warmup: bool = False):
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -878,27 +909,32 @@ class OptLM:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
-        if debug_mode is None:
-            if not overlap:
-                # No overlap, easy to understand, suitable for debugging
-                self.generation_loop_normal()
-            else:
-                # Overlap I/O and compute
-                if num_gpu_batches == 1:
-                    self.generation_loop_overlap_single_batch()
+        if not warmup:
+            with profile(activities=[
+            ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True, with_stack=True) as prof:
+                if debug_mode is None:
+                    if not overlap:
+                        # No overlap, easy to understand, suitable for debugging
+                        self.generation_loop_normal()
+                    else:
+                        # Overlap I/O and compute
+                        if num_gpu_batches == 1:
+                            self.generation_loop_overlap_single_batch()
+                        else:
+                            self.generation_loop_overlap_multi_batch()
+                elif debug_mode == "fewer_batch":
+                    # Run fewer layeres and batches for debugging
+                    if num_gpu_batches == 1:
+                        self.generation_loop_debug_single_batch()
+                    else:
+                        self.generation_loop_debug_multi_batch()
+                elif debug_mode == "breakdown":
+                    # No overlap, fewer batches, execution time breakdown
+                    self.generation_loop_debug_normal()
                 else:
-                    self.generation_loop_overlap_multi_batch()
-        elif debug_mode == "fewer_batch":
-            # Run fewer layeres and batches for debugging
-            if num_gpu_batches == 1:
-                self.generation_loop_debug_single_batch()
-            else:
-                self.generation_loop_debug_multi_batch()
-        elif debug_mode == "breakdown":
-            # No overlap, fewer batches, execution time breakdown
-            self.generation_loop_debug_normal()
-        else:
-            raise ValueError("Invalid debug mode: {debug_mode}")
+                    raise ValueError("Invalid debug mode: {debug_mode}")
+                save_format = f"{gpu_batch_size}_{num_gpu_batches}_{prompt_len}_{gen_len}_{overlap}_{self.pin_dha}"
+            write_torchprof_result(prof, "torchprof", save_format)
 
         # Delete cache
         for j in range(num_layers):
@@ -927,20 +963,28 @@ class OptLM:
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
-        execute_num_batches = 20
+        execute_num_batches = 120
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
         timers("prefill_total").reset()
         timers("decoding_gpu_batch").reset()
 
-        timers("load_weight").reset()
+        timers("load_weight_input_emb").reset()
+        timers("load_weight_output_emb").reset()
+        timers("load_weight").reset()   # load attention layer
         timers("load_cache_prefill").reset()
         timers("load_cache_decoding").reset()
         timers("store_cache_prefill").reset()
         timers("store_cache_decoding").reset()
         timers("compute_layer_prefill").reset()
-        timers("compute_layer_decoding").reset()
+        timers("compute_layer_decoding").reset()    # compute attention layer
+        timers("compute_input_emb_prefill").reset()
+        timers("compute_output_emb_prefill").reset()
+        timers("compute_input_emb_decoding").reset()
+        timers("compute_output_emb_decoding").reset()
         load_weight_timer = timers("load_weight")
+        load_w_input_emb_timer = timers("load_weight_input_emb")
+        load_w_output_emb_timer = timers("load_weight_output_emb")
 
         for i in range(self.execute_gen_len):
             if i == 0:
@@ -959,19 +1003,32 @@ class OptLM:
             for j in range(self.num_layers):
                 if i > 0: timers("decoding_gpu_batch").start()
 
-                load_weight_timer.start(self.sync)
+                load_w_timer = None
+                compute_timer = None
+                if isinstance(self.layers[j], InputEmbed):
+                    load_w_timer = load_w_input_emb_timer
+                    compute_timer = timers("compute_input_emb_prefill") if i==0 else timers("compute_input_emb_decoding")
+                elif isinstance(self.layers[j], OutputEmbed):
+                    print(i)
+                    load_w_timer = load_w_output_emb_timer
+                    compute_timer = timers("compute_output_emb_prefill") if i==0 else timers("compute_output_emb_decoding")
+                else:  # attention layer
+                    load_w_timer = load_weight_timer
+                    compute_timer = compute_layer_timer
+
+                load_w_timer.start(self.sync)
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j, k)
-                load_weight_timer.stop(self.sync)
+                load_w_timer.stop(self.sync)
 
                 for k in range(self.num_gpu_batches):
                     load_cache_timer.start(self.sync)
                     self.load_cache(i, j, k)
                     load_cache_timer.stop(self.sync)
                     self.load_hidden(i, j, k)
-                    compute_layer_timer.start(self.sync)
+                    compute_timer.start(self.sync)
                     self.compute_layer(i, j, k)
-                    compute_layer_timer.stop(self.sync)
+                    compute_timer.stop(self.sync)
                     self.store_hidden(i, j, k)
                     store_cache_timer.start(self.sync)
                     self.store_cache(i, j, k)
@@ -1000,10 +1057,14 @@ class OptLM:
               f"{self.num_layers * self.num_gpu_batches}")
         print(f"#batches decoding: "
               f"{(self.task.gen_len - 1) * self.num_layers * self.num_gpu_batches}")
-        print(f"load_weight            (per-layer)"
+        print(f"load_weight_attention  (per-layer)"
               f": {np.mean(timers('load_weight').costs):.6f} s")
+        print(f"load_weight_input_emb  (per-layer)"
+              f": {np.mean(timers('load_weight_input_emb').costs):.6f} s")
+        print(f"load_weight_output_emb (per-layer)"
+              f": {np.mean(timers('load_weight_output_emb').costs):.6f} s")
         for stage in ["prefill", "decoding"]:
-            for func in ["load_cache", "store_cache", "compute_layer"]:
+            for func in ["load_cache", "store_cache", "compute_layer", "compute_input_emb", "compute_output_emb"]:
                 name = func + "_" + stage
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
@@ -1221,13 +1282,13 @@ def run_flexgen(args):
     try:
         print("warmup - generate")
         output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+            warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
 
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
+            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose, warmup=False)
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()
@@ -1324,4 +1385,10 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
+    # change allocator
+    # new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
+    #     '/home/ycy/repo/torch-gds/cudamalloc/alloc.so', 'my_malloc', 'my_free')
+    # torch.cuda.memory.change_current_allocator(new_alloc)
+    torch.cuda.memory._record_memory_history()
     run_flexgen(args)
+    torch.cuda.memory._dump_snapshot("torchprof/memtl.pickle")
