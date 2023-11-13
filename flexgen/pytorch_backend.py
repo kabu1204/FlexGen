@@ -21,14 +21,14 @@ general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
 
-# torch.ops.load_library("/home/ycy/repo/torch-gds/build/torch_ext/libmycopy.so")
-# to_dha = torch.ops.dha.to_dha
-# add_dha = torch.ops.dha.add_dha
-# is_dha_tensor = torch.ops.dha.is_dha_tensor
-
 to_dha = None
 add_dha = None
 is_dha_tensor = None
+
+torch.ops.load_library("/home/ycy/repo/torch-gds/build/torch_ext/libmycopy.so")
+to_dha = torch.ops.dha.to_dha
+add_dha = torch.ops.dha.add_dha
+is_dha_tensor = torch.ops.dha.is_dha_tensor
 
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
@@ -159,6 +159,9 @@ class TorchTensor:
         ret = self.copy(dst)
         self.delete()
         return ret
+
+    def size_bytes(self):
+        return self.data.storage().element_size() * self.data.numel()
 
     def __str__(self):
         return (f"TorchTensor(shape={self.shape}, dtype={str(self.dtype)}, "

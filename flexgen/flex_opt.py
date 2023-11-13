@@ -26,6 +26,7 @@ from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     read_benchmark_log, write_torchprof_result)
 
 from torch.profiler import profile, record_function, ProfilerActivity
+from pypcm import PCIeEventAggr, PCIeEventIdx, PCIeMonitor
 
 fix_recursive_import()
 
@@ -68,6 +69,9 @@ class Policy:
     compress_cache: bool
     comp_cache_config: CompressionConfig
 
+    # pin whole attention layers
+    num_pinned_attn_layers: int
+
     @property
     def w_disk_percent(self):
         return 100 - self.w_gpu_percent - self.w_cpu_percent
@@ -90,8 +94,8 @@ def get_choice(cur_percent, percents, choices):
             return choices[i]
     return choices[-1]
 
-
-def init_weight_list(weight_specs, policy, env, pin_dha=False):
+# TODO: generalize
+def init_weight_list(weight_specs, policy, env, pin_dha=False, attn_layer_id: int = -1):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
 
@@ -99,8 +103,13 @@ def init_weight_list(weight_specs, policy, env, pin_dha=False):
     sizes_cumsum = np.cumsum(sizes)
     ret = []
     for i in range(len(weight_specs)):
-        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
-        home = get_choice(mid_percent * 100, dev_percents, dev_choices)
+        if 0 <= attn_layer_id < policy.num_pinned_attn_layers:
+            # TODO
+            print(f"pin attn layer {attn_layer_id} to GPU")
+            home = env.gpu
+        else:
+            mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
+            home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, dtype, filename = weight_specs[i]
 
         if len(shape) < 2:
@@ -277,11 +286,12 @@ class OutputEmbed:
 
 
 class SelfAttention:
-    def __init__(self, config, env, policy, layer_id):
+    def __init__(self, config, env, policy, layer_id, pin_dha=False):
         self.config = config
         self.env = env
         self.layer_id = layer_id
         self.policy = policy
+        self.pin_dha = pin_dha
         self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
@@ -318,7 +328,7 @@ class SelfAttention:
             # b_ln
             ((h,), dtype, path + "_layer_norm.bias"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
+        weights = init_weight_list(weight_specs, self.policy, self.env, self.pin_dha, self.layer_id)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -327,12 +337,20 @@ class SelfAttention:
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
-            weight_read_buf.store((
-                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
-                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
-                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
-                w_out.smart_copy(dst1), b_out.smart_copy(dst2),
-                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+            if self.pin_dha:
+                weight_read_buf.store((
+                    (w_q, True), (b_q, True),
+                    (w_k, True), (b_k, True),
+                    (w_v, True), (b_v, True),
+                    (w_out, True), (b_out, True),
+                    (w_ln, True), (b_ln, True)))
+            else:
+                weight_read_buf.store((
+                    w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+                    w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+                    w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+                    w_out.smart_copy(dst1), b_out.smart_copy(dst2),
+                    w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -512,7 +530,7 @@ class MLP:
             # b_ln
             ((h,), dtype, path + "final_layer_norm.bias"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
+        weights = init_weight_list(weight_specs, self.policy, self.env, False, self.layer_id)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -909,7 +927,29 @@ class OptLM:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
-        if not warmup:
+        if warmup:
+            if debug_mode is None:
+                if not overlap:
+                    # No overlap, easy to understand, suitable for debugging
+                    self.generation_loop_normal()
+                else:
+                    # Overlap I/O and compute
+                    if num_gpu_batches == 1:
+                        self.generation_loop_overlap_single_batch()
+                    else:
+                        self.generation_loop_overlap_multi_batch()
+            elif debug_mode == "fewer_batch":
+                # Run fewer layeres and batches for debugging
+                if num_gpu_batches == 1:
+                    self.generation_loop_debug_single_batch()
+                else:
+                    self.generation_loop_debug_multi_batch()
+            elif debug_mode == "breakdown":
+                # No overlap, fewer batches, execution time breakdown
+                self.generation_loop_debug_normal()
+            else:
+                raise ValueError("Invalid debug mode: {debug_mode}")
+        else:
             with profile(activities=[
             ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True, with_stack=True) as prof:
                 if debug_mode is None:
@@ -935,6 +975,34 @@ class OptLM:
                     raise ValueError("Invalid debug mode: {debug_mode}")
                 save_format = f"{gpu_batch_size}_{num_gpu_batches}_{prompt_len}_{gen_len}_{overlap}_{self.pin_dha}"
             write_torchprof_result(prof, "torchprof", save_format)
+
+        # # Generate
+        # if not warmup:
+        #     with profile(activities=[
+        #     ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True, with_stack=True) as prof:
+        #         if debug_mode is None:
+        #             if not overlap:
+        #                 # No overlap, easy to understand, suitable for debugging
+        #                 self.generation_loop_normal()
+        #             else:
+        #                 # Overlap I/O and compute
+        #                 if num_gpu_batches == 1:
+        #                     self.generation_loop_overlap_single_batch()
+        #                 else:
+        #                     self.generation_loop_overlap_multi_batch()
+        #         elif debug_mode == "fewer_batch":
+        #             # Run fewer layeres and batches for debugging
+        #             if num_gpu_batches == 1:
+        #                 self.generation_loop_debug_single_batch()
+        #             else:
+        #                 self.generation_loop_debug_multi_batch()
+        #         elif debug_mode == "breakdown":
+        #             # No overlap, fewer batches, execution time breakdown
+        #             self.generation_loop_debug_normal()
+        #         else:
+        #             raise ValueError("Invalid debug mode: {debug_mode}")
+        #         save_format = f"{gpu_batch_size}_{num_gpu_batches}_{prompt_len}_{gen_len}_{overlap}_{self.pin_dha}"
+        #     write_torchprof_result(prof, "torchprof", save_format)
 
         # Delete cache
         for j in range(num_layers):
@@ -963,7 +1031,7 @@ class OptLM:
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
-        execute_num_batches = 120
+        execute_num_batches = 300
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
         timers("prefill_total").reset()
@@ -1009,7 +1077,6 @@ class OptLM:
                     load_w_timer = load_w_input_emb_timer
                     compute_timer = timers("compute_input_emb_prefill") if i==0 else timers("compute_input_emb_decoding")
                 elif isinstance(self.layers[j], OutputEmbed):
-                    print(i)
                     load_w_timer = load_w_output_emb_timer
                     compute_timer = timers("compute_output_emb_prefill") if i==0 else timers("compute_output_emb_decoding")
                 else:  # attention layer
@@ -1058,16 +1125,16 @@ class OptLM:
         print(f"#batches decoding: "
               f"{(self.task.gen_len - 1) * self.num_layers * self.num_gpu_batches}")
         print(f"load_weight_attention  (per-layer)"
-              f": {np.mean(timers('load_weight').costs):.6f} s")
+              f": {np.mean(timers('load_weight').costs)*1e3:.6f} ms")
         print(f"load_weight_input_emb  (per-layer)"
-              f": {np.mean(timers('load_weight_input_emb').costs):.6f} s")
+              f": {np.mean(timers('load_weight_input_emb').costs)*1e3:.6f} ms")
         print(f"load_weight_output_emb (per-layer)"
-              f": {np.mean(timers('load_weight_output_emb').costs):.6f} s")
+              f": {np.mean(timers('load_weight_output_emb').costs)*1e3:.6f} ms")
         for stage in ["prefill", "decoding"]:
             for func in ["load_cache", "store_cache", "compute_layer", "compute_input_emb", "compute_output_emb"]:
                 name = func + "_" + stage
                 costs = timers(name).costs
-                print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
+                print(f"{name:22s} (per-batch): {np.mean(costs)*1e3:.6f} ms")
 
     def generation_loop_overlap_single_batch(self):
         # Prologue
@@ -1162,7 +1229,7 @@ class OptLM:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
     def generation_loop_debug_multi_batch(self):
-        execute_num_batches = 20
+        execute_num_batches = 200
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
         timers("prefill").reset()
@@ -1174,13 +1241,18 @@ class OptLM:
         self.load_hidden(0, 0, 0)
         self.sync()
 
+        pcm = PCIeMonitor.Instance()
+        pcm.Clear()
+
         # Generate
         for i in range(self.execute_gen_len):
             if i == 0: timers("prefill").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
             for j in range(self.num_layers):
-                if i > 0: timers("decoding_gpu_batch").start()
+                if i > 0: 
+                    timers("decoding_gpu_batch").start()
+                    pcm.StartGroup(0)
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j+1, k)
                     self.load_cache(i, j, k+1)
@@ -1191,15 +1263,21 @@ class OptLM:
                     self.sync()
 
                 if i > 0:
+                    pcm.StopGroup(0)
                     timers("decoding_gpu_batch").stop()
                     pbar.update(1)
                     batch_ct += 1
                 if batch_ct >= execute_num_batches: break
+            if i > 0:
+                elapsed_ms = pcm.GetDurationNs()/1e6
+                print(f"duration: {elapsed_ms}ms, \
+                      ReadBW: {pcm.GetReadBW()/(1<<20):.2f}MB/s, \
+                      WriteBW: {pcm.GetWriteBW()/(1<<20):.2f}MB/s")
             if batch_ct >= execute_num_batches: break
             if i == 0: timers("prefill").stop()
 
         # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
+        batch_cost = np.mean(timers("decoding_gpu_batch").costs[0:])
         for i in range(self.execute_gen_len):
             if i == 0:
                 timers("generate").costs.append(timers("prefill").costs[0])
@@ -1266,7 +1344,7 @@ def run_flexgen(args):
                                       group_dim=0, symmetric=False),
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+                                      group_dim=2, symmetric=False), 17)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
